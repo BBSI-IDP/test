@@ -1,0 +1,153 @@
+# Validate Backstage catalog-info.yaml files.
+#
+# Two ways this runs:
+#   1. Directly on this repo's PRs (pull_request trigger below) — guards the
+#      platform catalog under ./catalog and any catalog-info.yaml here.
+#   2. As a REUSABLE workflow each service repo calls, so a broken entity is
+#      caught in the service's own PR before it ever reaches the catalog:
+#
+#        # .github/workflows/catalog.yaml in a service repo
+#        name: Catalog
+#        on: pull_request
+#        jobs:
+#          validate:
+#            uses: <ORG>/idp-ui/.github/workflows/validate-catalog-info.yaml@main
+#
+# Validation is self-contained (Python + PyYAML, preinstalled on ubuntu runners) —
+# no third-party Actions, no Backstage runtime needed in the caller repo.
+name: Validate catalog-info
+
+on:
+  pull_request:
+    paths:
+      - '**/catalog-info.yaml'
+      - 'catalog/**'
+      - '.github/workflows/validate-catalog-info.yaml'
+  workflow_call:
+    inputs:
+      path:
+        description: Directory to scan for catalog-info.yaml (default repo root)
+        required: false
+        type: string
+        default: '.'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate catalog entities
+        shell: bash
+        env:
+          SCAN_PATH: ${{ inputs.path || '.' }}
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+          python3 - "$SCAN_PATH" <<'PY'
+          import sys, glob, os, re
+          import yaml
+
+          ROOT = sys.argv[1] if len(sys.argv) > 1 else '.'
+
+          # Known apiVersions and the kinds Backstage understands.
+          API_VERSIONS = {
+              'backstage.io/v1alpha1', 'backstage.io/v1beta1',
+              'scaffolder.backstage.io/v1beta3',
+          }
+          KINDS = {
+              'Component', 'API', 'Resource', 'System', 'Domain',
+              'Group', 'User', 'Location', 'Template',
+          }
+          NAME_RE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$')
+
+          # Per-kind required spec fields (the ones whose absence breaks ingestion
+          # or ownership/graph wiring).
+          REQUIRED_SPEC = {
+              'Component': ['type', 'lifecycle', 'owner'],
+              'API':       ['type', 'lifecycle', 'owner', 'definition'],
+              'Resource':  ['type', 'owner'],
+              'System':    ['owner'],
+              'Domain':    ['owner'],
+              'Group':     ['type'],
+              'Template':  ['type', 'steps'],
+              'Location':  [],
+              'User':      [],
+          }
+
+          files = sorted(set(
+              glob.glob(os.path.join(ROOT, 'catalog-info.yaml')) +
+              glob.glob(os.path.join(ROOT, '**', 'catalog-info.yaml'), recursive=True)
+          ))
+          # Skip scaffolder template skeletons — their ${{ values.* }} placeholders
+          # are intentionally unrendered and would false-fail validation.
+          files = [f for f in files
+                   if 'skeleton' not in f.replace(os.sep, '/').split('/')]
+          if not files:
+              print(f'No catalog-info.yaml found under {ROOT!r} — nothing to validate.')
+              sys.exit(0)
+
+          errors = []
+
+          def check(path, idx, doc):
+              where = f'{path} (document #{idx + 1})'
+              if not isinstance(doc, dict):
+                  errors.append(f'{where}: top-level value is not a mapping')
+                  return
+              av = doc.get('apiVersion')
+              if not av:
+                  errors.append(f'{where}: missing apiVersion')
+              elif av not in API_VERSIONS:
+                  errors.append(f'{where}: unknown apiVersion {av!r} '
+                                f'(expected one of {sorted(API_VERSIONS)})')
+              kind = doc.get('kind')
+              if not kind:
+                  errors.append(f'{where}: missing kind')
+              elif kind not in KINDS:
+                  errors.append(f'{where}: unknown kind {kind!r} '
+                                f'(expected one of {sorted(KINDS)})')
+
+              meta = doc.get('metadata')
+              if not isinstance(meta, dict):
+                  errors.append(f'{where}: missing metadata block')
+              else:
+                  name = meta.get('name')
+                  if not name:
+                      errors.append(f'{where}: missing metadata.name')
+                  elif not NAME_RE.match(str(name)):
+                      errors.append(f'{where}: metadata.name {name!r} is not a valid '
+                                    f'entity name (letters/digits/[-._], max 63 chars)')
+
+              spec = doc.get('spec')
+              required = REQUIRED_SPEC.get(kind, [])
+              if required:
+                  if not isinstance(spec, dict):
+                      errors.append(f'{where}: {kind} requires a spec block')
+                  else:
+                      for field in required:
+                          if not spec.get(field):
+                              errors.append(f'{where}: {kind} missing required '
+                                            f'spec.{field}')
+
+          for path in files:
+              with open(path, encoding='utf-8') as fh:
+                  raw = fh.read()
+              try:
+                  docs = list(yaml.safe_load_all(raw))
+              except yaml.YAMLError as exc:
+                  errors.append(f'{path}: invalid YAML — {exc}')
+                  continue
+              docs = [d for d in docs if d is not None]
+              if not docs:
+                  errors.append(f'{path}: file is empty / contains no documents')
+                  continue
+              for idx, doc in enumerate(docs):
+                  check(path, idx, doc)
+
+          print(f'Checked {len(files)} catalog-info.yaml file(s).')
+          if errors:
+              print('\n  FAILED — fix these before the entity can be registered:\n')
+              for e in errors:
+                  print(f'  - {e}')
+              sys.exit(1)
+          print('  All catalog entities are valid.')
+          PY
