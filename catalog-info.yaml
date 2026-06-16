@@ -1,1 +1,12 @@
-
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: test
+  description: Test service to verify GitHub auto-discovery.
+  annotations:
+    github.com/project-slug: BBSI-IDP/test
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:default/grp_bbsiidp_skunkworks_nonprod
+  system: bbsiidp
